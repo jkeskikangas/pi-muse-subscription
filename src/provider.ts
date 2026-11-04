@@ -31,6 +31,11 @@ export class MuseSdkProvider {
 	private readonly all = new Set<MuseSession>();
 	/** Hosts a provider call is reading right now. */
 	private readonly active = new Set<MuseSession>();
+	/** Provider calls in flight, including one still opening its host. */
+	private inFlight = 0;
+	/** Set by `retire()`: hosts drop as their call finishes instead of returning to the pool. */
+	private retired = false;
+	private onDrained: (() => void) | undefined;
 	private readonly opts: Required<Omit<ProviderOptions, "debug">> & Pick<ProviderOptions, "debug">;
 	private timer?: NodeJS.Timeout;
 	lastRoute?: Route;
@@ -70,6 +75,7 @@ export class MuseSdkProvider {
 			stream.push({ type: "error", reason, error: output });
 			stream.end();
 		};
+		this.inFlight += 1;
 		try {
 			if (options?.maxTokens === 1) {
 				// A cache-warming replay. Muse Code keeps its own prompt cache per session; answer without
@@ -145,8 +151,12 @@ export class MuseSdkProvider {
 			if (session) {
 				session.busy = false;
 				this.active.delete(session);
+				// A retiring provider keeps no pool: this host's call is done, so it drops now.
+				if (this.retired && !session.dead) this.drop(session);
 			}
-			this.scheduleSweep();
+			this.inFlight -= 1;
+			this.checkDrained();
+			if (!this.retired) this.scheduleSweep();
 		}
 	}
 
@@ -438,7 +448,29 @@ export class MuseSdkProvider {
 		}
 	}
 
+	/**
+	 * Graceful teardown once no runtime holds this provider any more: idle hosts (including
+	 * one parked on tool calls between steps) drop now, a host with a call in flight drops
+	 * when that call finishes, and `onDrained` runs once no call is in flight any more so
+	 * the caller can close the bridge. An in-flight call is never killed here.
+	 */
+	retire(onDrained: () => void): void {
+		if (this.retired) return;
+		this.retired = true;
+		this.onDrained = onDrained;
+		for (const s of new Set([...this.sessions, ...this.all])) if (!this.active.has(s)) this.drop(s);
+		this.checkDrained();
+	}
+
+	private checkDrained(): void {
+		if (!this.retired || this.inFlight > 0 || !this.onDrained) return;
+		const onDrained = this.onDrained;
+		this.onDrained = undefined;
+		onDrained();
+	}
+
 	shutdown(): void {
+		this.onDrained = undefined;
 		for (const s of new Set([...this.sessions, ...this.all])) this.drop(s);
 	}
 }
